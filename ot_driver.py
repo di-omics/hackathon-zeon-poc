@@ -49,6 +49,9 @@ GCODE_ESTOP = "M112"              # emergency stop -> latches HALT state
 GCODE_CLEAR_HALT = "M999"         # clear HALT so commands are accepted again
 GCODE_DISABLE_STEPPERS = "M18"    # de-energize steppers
 GCODE_ENDSTOPS = "M119"           # report endstop states
+GCODE_WAIT_MOVES = "M400"         # blocks until the planner queue drains, so its
+                                  # ack is the real "movement finished" signal.
+                                  # G0/G28.2 ack when QUEUED, not when arrived.
 SMOOTHIE_RESET = b"\x18"          # Ctrl-X: handled at the serial layer, so it
                                   # interrupts an in-flight move. M112 alone can
                                   # sit behind a queued long move.
@@ -73,6 +76,11 @@ CONFIG_KEYS = (
 # default until the cause is found. Pass --axes to override deliberately.
 DEFAULT_HOME_AXES = ("Z", "A", "X")
 STALLED_AXES = ("Y",)
+# Axes whose direction convention is not verified on this machine. They are
+# homed (which is endstop-bounded and therefore safe) but never included in a
+# default move, because guessing the sign drives the pipette into the deck.
+# Pass them explicitly to move them on purpose.
+UNVERIFIED_AXES = ("Z",)
 
 # --- Soft limits, in mm. Conservative; deliberately smaller than the true ----
 # envelope so a bad demo coordinate stops here instead of at a hard stop.
@@ -125,9 +133,9 @@ class Transport:
                 axes: Optional[Tuple[str, ...]] = None) -> None: ...
     def position(self) -> Position: ...
 
-    def estop(self) -> None:
-        """Cut motion. No-op where the transport has no notion of it."""
-        return None
+    def estop(self) -> bool:
+        """Cut motion. Returns False where the transport cannot actually do it."""
+        return False
 
     def endstops(self) -> Dict[str, int]:
         raise TransportError("endstop read is not supported by this transport")
@@ -163,8 +171,9 @@ class SimTransport(Transport):
         self.pos = Position(0.0, 0.0, 0.0)
         self.log.append(f"home {','.join(axes) if axes else 'default'}")
 
-    def estop(self) -> None:
+    def estop(self) -> bool:
         self.log.append("estop")
+        return False  # a simulator stops nothing physical; never claim it did
 
     def endstops(self) -> Dict[str, int]:
         return {"min_x": 0, "min_y": 0, "min_z": 0, "min_a": 0, "min_b": 0}
@@ -210,7 +219,11 @@ class SerialGCodeTransport(Transport):
         except ImportError as e:
             raise TransportError("pyserial is required: pip install pyserial") from e
         try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=self.read_poll)
+            # write_timeout matters: without it, a write to a board that is
+            # enumerated but wedged blocks forever, which would hang the very
+            # estop meant to rescue that situation.
+            self._ser = serial.Serial(self.port, self.baud,
+                                      timeout=self.read_poll, write_timeout=2.0)
         except Exception as e:
             raise TransportError(f"cannot open {self.port}: {e}") from e
         # Smoothieboard resets on DTR; give the firmware time to come up.
@@ -258,24 +271,31 @@ class SerialGCodeTransport(Transport):
                 return True
         return False
 
-    def estop(self) -> None:
+    def estop(self) -> bool:
         """Cut motion immediately. Best effort, never raises.
 
         Ctrl-X goes first because it is handled at the serial layer and so
         interrupts a move already executing; M112 can otherwise sit in the
         queue behind that very move. Closing the port does neither, which is
         why the original stall kept grinding after the script exited.
+
+        Returns True only if at least one payload was actually written to the
+        port. Callers MUST report that honestly: an estop that printed success
+        while writing nothing would be worse than no estop at all.
         """
         if self._ser is None:
-            return
+            return False
+        wrote = False
         for payload in (SMOOTHIE_RESET, (GCODE_ESTOP + "\r\n").encode(),
                         (GCODE_DISABLE_STEPPERS + "\r\n").encode()):
             try:
                 self._ser.write(payload)
                 self._ser.flush()
+                wrote = True
                 time.sleep(0.25)
             except Exception:
                 pass
+        return wrote
 
     def _send(self, cmd: str, motion: bool = False,
               timeout: Optional[float] = None) -> str:
@@ -283,6 +303,13 @@ class SerialGCodeTransport(Transport):
             raise TransportError("serial port is not open")
         budget = timeout if timeout is not None else (
             self.motion_timeout if motion else self.ack_timeout)
+        # Drop anything left over from a previous command. A single orphaned
+        # "ok" in the buffer would otherwise satisfy THIS command instantly,
+        # which silently disables the no-ack stall detection below.
+        try:
+            self._ser.reset_input_buffer()
+        except Exception:
+            pass
         self._raw(cmd)
         deadline = time.time() + budget
         buf = ""
@@ -309,6 +336,18 @@ class SerialGCodeTransport(Transport):
                 f"direction, or a dead endstop switch)."
             )
         raise TransportError(f"timed out waiting for ack to {cmd!r}")
+
+    def _motion(self, cmd: str) -> None:
+        """Issue a motion command and wait until the motion actually finishes.
+
+        G0 and G28.2 acknowledge when the command is QUEUED, not when the
+        gantry arrives. So an ack on the move itself proves nothing and a
+        timeout on it cannot detect a stall. M400 blocks until the planner
+        queue drains, so its ack is the real "finished" signal and is the one
+        worth timing out on and firing the estop from.
+        """
+        self._send(cmd, motion=True)
+        self._send(GCODE_WAIT_MOVES, motion=True)
 
     # -- queries ------------------------------------------------------------
     def endstops(self) -> Dict[str, int]:
@@ -360,29 +399,26 @@ class SerialGCodeTransport(Transport):
         limits: Dict[str, Tuple[float, float]] = {}
         for axis in ("X", "Y", "Z"):
             vals = cfg.get(axis, {})
-            lo_s, hi_s, travel_s = vals.get("min", ""), vals.get("max", ""), vals.get("max_travel", "")
             lo = hi = None
             try:
-                lo = float(lo_s)
+                lo = float(vals.get("min", ""))
             except (TypeError, ValueError):
                 pass
             try:
-                hi = float(hi_s)
+                hi = float(vals.get("max", ""))
             except (TypeError, ValueError):
                 pass
-            if hi is None:
-                # Some configs express the envelope only as max_travel.
-                try:
-                    hi = float(travel_s)
-                except (TypeError, ValueError):
-                    hi = None
-            if lo is None:
-                lo = 0.0
-            if hi is not None and hi > lo:
-                limits[axis.lower()] = (lo, hi)
+            # Deliberately NOT falling back to max_travel. max_travel is the
+            # distance homing is allowed to SEARCH, and it is normally set
+            # larger than the axis so homing cannot come up short. Using it as
+            # the soft-limit ceiling would widen the envelope past the physical
+            # end of travel, which is the exact overreach this is meant to stop.
+            if lo is None or hi is None or hi <= lo:
+                continue
+            limits[axis.lower()] = (lo, hi)
         if not limits:
             raise TransportError(
-                "the board reported no usable min/max/max_travel values, so the "
+                "the board reported no usable min/max pair for any axis, so the "
                 "envelope cannot be learned. Do not guess it."
             )
         return limits
@@ -394,7 +430,7 @@ class SerialGCodeTransport(Transport):
         # before the gantry sweeps in X/Y. That is the order the Opentrons
         # software uses; reversing it drags a low pipette across the deck.
         for axis in (axes if axes is not None else DEFAULT_HOME_AXES):
-            self._send(f"{GCODE_HOME} {axis}", motion=True)
+            self._motion(f"{GCODE_HOME} {axis}")
 
     def move_to(self, x: float, y: float, z: float, feedrate: float,
                 axes: Optional[Tuple[str, ...]] = None) -> None:
@@ -406,7 +442,7 @@ class SerialGCodeTransport(Transport):
         words = " ".join(f"{a}{vals[a]:.2f}" for a in ("X", "Y", "Z") if a in allowed)
         if not words:
             raise TransportError("move_to called with no movable axes")
-        self._send(f"{GCODE_MOVE} {words} F{feedrate:.0f}", motion=True)
+        self._motion(f"{GCODE_MOVE} {words} F{feedrate:.0f}")
 
     def position(self) -> Position:
         # This board replies e.g.:
@@ -534,6 +570,7 @@ class OTDriver:
         self._homed = False
         self._homed_axes: Tuple[str, ...] = ()
         self._learned_limits: Optional[Dict[str, Tuple[float, float]]] = None
+        self._position_known = False
         self._open = False
 
     # -- lifecycle ----------------------------------------------------------
@@ -594,16 +631,33 @@ class OTDriver:
                 )
 
     # -- motion -------------------------------------------------------------
-    def estop(self) -> None:
-        """Cut motion now. Safe to call unconditionally."""
-        self.t.estop()
+    def estop(self) -> bool:
+        """Cut motion now. Safe to call unconditionally.
+
+        Ctrl-X resets the board, which DISCARDS its homing reference. The
+        Python object must forget it too, or the next move would be commanded
+        absolutely from a position the board no longer knows, re-arming the
+        exact hard-stop scenario the unhomed-axis guard exists to prevent.
+        """
+        wrote = self.t.estop()
+        self._homed = False
+        self._homed_axes = ()
+        self._position_known = False
+        return wrote
 
     def endstops(self) -> Dict[str, int]:
         return self.t.endstops()
 
     def home(self, axes: Optional[Tuple[str, ...]] = None) -> None:
         self._guard_motion()
-        self.t.home(axes)
+        # BaseException, not Exception: a Ctrl-C mid-home must still cut motion.
+        # Without this, KeyboardInterrupt unwinds the stack and closes the port
+        # while the axis keeps driving, which is exactly the original failure.
+        try:
+            self.t.home(axes)
+        except BaseException:
+            self.estop()
+            raise
         self._homed = True
         self._homed_axes = tuple(axes) if axes is not None else DEFAULT_HOME_AXES
         # Read back rather than assuming home is the origin. On this hardware
@@ -611,17 +665,40 @@ class OTDriver:
         # would make every subsequent relative move compute from a false base.
         try:
             self._last = self.t.position()
+            self._position_known = True
         except TransportError:
-            self._last = Position(0.0, 0.0, 0.0)
+            # Do NOT fabricate an origin here. A failed read-back means the
+            # position is genuinely unknown, and inventing (0,0,0) would give
+            # every later relative move a fake datum, which could drive a mount
+            # from the top of its travel down to zero. Absolute moves are still
+            # fine; only relative ones need a datum, and jog() checks this flag.
+            self._position_known = False
 
     @property
     def homed_axes(self) -> Tuple[str, ...]:
         return self._homed_axes
 
     @property
+    def position_known(self) -> bool:
+        return self._position_known
+
+    @property
     def movable_axes(self) -> Tuple[str, ...]:
         """Cartesian axes that have been homed, so are safe to command."""
         return tuple(a for a in ("X", "Y", "Z") if a in self._homed_axes)
+
+    @property
+    def safe_axes(self) -> Tuple[str, ...]:
+        """Axes a move will touch when the caller does not name any.
+
+        Excludes axes whose direction convention is unverified, and, once the
+        envelope has been learned, any axis the board gave no limits for. Name
+        an axis explicitly to move it anyway.
+        """
+        out = [a for a in self.movable_axes if a not in UNVERIFIED_AXES]
+        if self._learned_limits:
+            out = [a for a in out if a.lower() in self._learned_limits]
+        return tuple(out)
 
     def move_to(self, x: float, y: float, z: float,
                 feedrate: Optional[float] = None,
@@ -629,7 +706,7 @@ class OTDriver:
         self._guard_motion()
         if not self._homed:
             raise TransportError("home() before moving; position is unknown until homed")
-        target = axes if axes is not None else self.movable_axes
+        target = axes if axes is not None else self.safe_axes
         unhomed = [a for a in target if a not in self._homed_axes]
         if unhomed:
             raise TransportError(
@@ -662,9 +739,19 @@ class OTDriver:
         return self._last
 
     def jog(self, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
-            feedrate: Optional[float] = None) -> Position:
+            feedrate: Optional[float] = None,
+            axes: Optional[Tuple[str, ...]] = None) -> Position:
+        # A relative move needs a trustworthy starting point. Absolute moves do
+        # not, which is why only this path enforces it.
+        if not self._position_known:
+            raise TransportError(
+                "position is unknown (the read-back failed, or an estop reset "
+                "the board and discarded its homing reference), so a relative "
+                "move has no valid datum. Home again before jogging."
+            )
         base = self._last
-        return self.move_to(base.x + dx, base.y + dy, base.z + dz, feedrate)
+        return self.move_to(base.x + dx, base.y + dy, base.z + dz,
+                            feedrate, axes)
 
     def position(self) -> Position:
         """Live read where the transport supports it, else the cached target."""
@@ -820,11 +907,19 @@ def cmd_estop(args) -> int:
         # runs its handshake, so the estop write can land even if that failed.
         print(f"connect reported: {e}")
     print("sending emergency stop ...")
-    transport.estop()
+    wrote = transport.estop()
     transport.close()
-    print("sent: Ctrl-X reset, M112 halt, M18 steppers off.")
-    print("If the noise continues, cut power at the switch. Do not rely on software here.")
-    return 0
+    if wrote:
+        print("WROTE to the board: Ctrl-X reset, M112 halt, M18 steppers off.")
+    else:
+        print("NOTHING WAS SENT. No bytes reached any board.")
+        if args.transport == "sim":
+            print("  Transport is 'sim', which stops nothing physical.")
+            print("  Use: --transport serial --port /dev/cu.usbmodem<NNN>")
+        else:
+            print("  The port could not be opened, or every write failed.")
+    print("If the noise continues, cut power at the switch. Do not rely on software.")
+    return 0 if wrote else 1
 
 
 def cmd_endstops(args) -> int:
@@ -943,9 +1038,13 @@ def cmd_home(args) -> int:
         driver.disconnect()
         return 1
 
-    pos = driver.position()
-    print(f"\nhomed. TRUE home position: {pos}")
-    print("Record these numbers; they define the real envelope for SOFT_LIMITS.")
+    if driver.position_known:
+        print(f"\nhomed. TRUE home position: {driver.position()}")
+        print("Record these numbers; they are the real datum for this machine.")
+    else:
+        print("\nhomed, but the position READ-BACK FAILED, so the datum is unknown.")
+        print("Not printing a number here: inventing one is how a bogus datum")
+        print("gets recorded as fact. Re-run to retry the read.")
     driver.disconnect()
     return 0
 
@@ -1016,8 +1115,14 @@ def cmd_demo(args) -> int:
         print("returning home ...")
         driver.home(_axes)
         print(f"  home. position {driver.position()}")
-    except (TransportError, OutOfBounds, MotionBlocked) as e:
-        print(f"MOTION ABORTED: {e}")
+    except BaseException as e:
+        # BaseException so Ctrl-C also reaches the estop rather than unwinding
+        # with the gantry still moving.
+        print(f"MOTION ABORTED: {type(e).__name__}: {e}")
+        if driver.estop():
+            print("emergency stop written to the board.")
+        else:
+            print("emergency stop could NOT be written. Cut power at the switch.")
         driver.disconnect()
         return 1
 
@@ -1032,8 +1137,12 @@ def main() -> int:
 
     sub.add_parser("detect", help="find attached/reachable hardware, no motion")
 
-    def add_conn_args(p):
-        p.add_argument("--transport", choices=["sim", "serial", "http"], default="sim")
+    def add_conn_args(p, default_transport: str = "sim"):
+        # Hardware-facing commands default to serial. Defaulting the panic
+        # button to the simulator would let it report success while writing
+        # nothing to any board.
+        p.add_argument("--transport", choices=["sim", "serial", "http"],
+                       default=default_transport)
         p.add_argument("--port", help="serial device, e.g. /dev/cu.usbmodem1234")
         p.add_argument("--baud", type=int, default=SERIAL_BAUD)
         p.add_argument("--host", help="robot IP for the http transport")
@@ -1051,9 +1160,9 @@ def main() -> int:
 
     add_conn_args(sub.add_parser("home", help="home only, then report true home coords"))
     add_conn_args(sub.add_parser("demo", help="home, then run a short move sequence"))
-    add_conn_args(sub.add_parser("estop", help="panic button: cut motion now"))
-    add_conn_args(sub.add_parser("endstops", help="read endstop states, no motion"))
-    add_conn_args(sub.add_parser("config", help="dump the board's axis config, no motion"))
+    add_conn_args(sub.add_parser("estop", help="panic button: cut motion now"), "serial")
+    add_conn_args(sub.add_parser("endstops", help="read endstop states, no motion"), "serial")
+    add_conn_args(sub.add_parser("config", help="dump the board's axis config, no motion"), "serial")
 
     args = ap.parse_args()
     if args.cmd == "detect":

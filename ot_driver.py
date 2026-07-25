@@ -124,6 +124,10 @@ class Transport:
     """Interface every transport implements."""
 
     model = "sim"
+    # Set by estop(). Ctrl-X resets the board and discards its homing reference,
+    # and _send can fire estop from deep inside the transport where OTDriver
+    # cannot see it. This flag is how that fact travels back up.
+    reference_lost = False
 
     def open(self) -> None: ...
     def close(self) -> None: ...
@@ -173,6 +177,7 @@ class SimTransport(Transport):
 
     def estop(self) -> bool:
         self.log.append("estop")
+        self.reference_lost = True
         return False  # a simulator stops nothing physical; never claim it did
 
     def endstops(self) -> Dict[str, int]:
@@ -211,9 +216,11 @@ class SerialGCodeTransport(Transport):
     # deadline. With pyserial's timeout set to the full budget, a single
     # readline() blocks for the whole budget and the deadline never gets to run.
     read_poll: float = 0.25
+    reference_lost: bool = False
     _ser: Optional[object] = None
 
     def open(self) -> None:
+        self.reference_lost = False   # fresh connection, no stale loss carried in
         try:
             import serial  # pyserial
         except ImportError as e:
@@ -223,7 +230,7 @@ class SerialGCodeTransport(Transport):
             # enumerated but wedged blocks forever, which would hang the very
             # estop meant to rescue that situation.
             self._ser = serial.Serial(self.port, self.baud,
-                                      timeout=self.read_poll, write_timeout=2.0)
+                                      timeout=self.read_poll, write_timeout=0.5)
         except Exception as e:
             raise TransportError(f"cannot open {self.port}: {e}") from e
         # Smoothieboard resets on DTR; give the firmware time to come up.
@@ -283,17 +290,26 @@ class SerialGCodeTransport(Transport):
         port. Callers MUST report that honestly: an estop that printed success
         while writing nothing would be worse than no estop at all.
         """
+        # Mark the reference lost even if no byte lands: if we are trying to
+        # stop, the machine's position can no longer be trusted either way.
+        self.reference_lost = True
         if self._ser is None:
             return False
         wrote = False
         for payload in (SMOOTHIE_RESET, (GCODE_ESTOP + "\r\n").encode(),
                         (GCODE_DISABLE_STEPPERS + "\r\n").encode()):
             try:
+                # Deliberately NOT calling flush(). On POSIX flush() is
+                # tcdrain(), which waits for the output buffer to drain and is
+                # NOT bounded by write_timeout, so it can block forever against
+                # exactly the wedged board this is meant to rescue. write()
+                # alone hands the bytes to the kernel, which is enough.
                 self._ser.write(payload)
-                self._ser.flush()
                 wrote = True
-                time.sleep(0.25)
+                time.sleep(0.2)
             except Exception:
+                # Includes SerialTimeoutException from write_timeout. Keep
+                # trying the remaining payloads; report honestly at the end.
                 pass
         return wrote
 
@@ -612,7 +628,21 @@ class OTDriver:
         self._learned_limits = self.t.learn_limits()
         return self._learned_limits
 
+    def _sync_reference(self) -> None:
+        """Adopt a reference loss the transport reported from inside a send.
+
+        _send fires estop() directly on a motion timeout, which resets the board
+        and destroys its homing reference. Without this, the driver would still
+        believe it was homed and would happily issue the next absolute move from
+        a datum the board no longer has.
+        """
+        if getattr(self.t, "reference_lost", False):
+            self._homed = False
+            self._homed_axes = ()
+            self._position_known = False
+
     def _guard_motion(self) -> None:
+        self._sync_reference()
         if not self._open:
             raise TransportError("not connected; call connect() first")
         if not self.allow_motion:
@@ -650,6 +680,12 @@ class OTDriver:
 
     def home(self, axes: Optional[Tuple[str, ...]] = None) -> None:
         self._guard_motion()
+        # Clear the reference FIRST. If this home fails partway through, the
+        # axis list from a PREVIOUS successful home must not survive and go on
+        # claiming those axes are referenced when the board has been reset.
+        self._homed = False
+        self._homed_axes = ()
+        self._position_known = False
         # BaseException, not Exception: a Ctrl-C mid-home must still cut motion.
         # Without this, KeyboardInterrupt unwinds the stack and closes the port
         # while the axis keeps driving, which is exactly the original failure.
@@ -658,6 +694,9 @@ class OTDriver:
         except BaseException:
             self.estop()
             raise
+        # A completed home re-establishes the reference, so clear the flag or
+        # _sync_reference would keep tearing down the state we just earned.
+        self.t.reference_lost = False
         self._homed = True
         self._homed_axes = tuple(axes) if axes is not None else DEFAULT_HOME_AXES
         # Read back rather than assuming home is the origin. On this hardware
@@ -728,7 +767,9 @@ class OTDriver:
                 )
         try:
             self.t.move_to(x, y, z, feedrate or self.default_feedrate, target)
-        except Exception:
+        except BaseException:
+            # BaseException so a Ctrl-C mid-move also cuts motion instead of
+            # unwinding the stack with the gantry still travelling.
             self.estop()
             raise
         self._last = Position(
@@ -897,8 +938,93 @@ def parse_axes(spec: Optional[str]) -> Optional[Tuple[str, ...]]:
     return axes
 
 
+_ACTIVE_MOTION_TRANSPORT: Optional[Transport] = None
+
+
+def _install_panic_handlers(transport: Transport) -> None:
+    """Make Ctrl-C and SIGTERM cut motion before the process unwinds.
+
+    Ctrl-C is the first thing an operator reaches for on hearing a grind. Left
+    unhandled it kills the process before any timeout can fire the estop, so the
+    axis keeps driving and the interrupt makes the outcome strictly WORSE than
+    doing nothing.
+    """
+    global _ACTIVE_MOTION_TRANSPORT
+    _ACTIVE_MOTION_TRANSPORT = transport
+    import signal
+
+    def _handler(signum, _frame):
+        t = _ACTIVE_MOTION_TRANSPORT
+        print(f"\nsignal {signum} received: cutting motion first ...")
+        if t is not None and t.estop():
+            print("emergency stop written to the board.")
+        else:
+            print("emergency stop could NOT be written. CUT POWER AT THE SWITCH NOW.")
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
+
+
+def panic_estop_serial(port: str, baud: int = SERIAL_BAUD) -> bool:
+    """Open a serial port and write the stop sequence with NO handshake.
+
+    The normal open() sleeps ~2s for the board to boot and then probes it. When
+    an axis is grinding, those two seconds are two seconds of damage, so this
+    path writes Ctrl-X the instant the port exists and skips every check.
+    """
+    try:
+        import serial
+    except ImportError:
+        print("pyserial is not installed, so nothing can be sent.")
+        return False
+    try:
+        ser = serial.Serial(port, baud, timeout=0.25, write_timeout=0.5)
+    except Exception as e:
+        print(f"could not open {port}: {e}")
+        return False
+    wrote = False
+    try:
+        for payload in (SMOOTHIE_RESET, (GCODE_ESTOP + "\r\n").encode(),
+                        (GCODE_DISABLE_STEPPERS + "\r\n").encode()):
+            try:
+                ser.write(payload)   # no flush: tcdrain can block forever
+                wrote = True
+                time.sleep(0.2)
+            except Exception:
+                pass
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+    return wrote
+
+
 def cmd_estop(args) -> int:
     """Panic button. Cuts motion; commands none."""
+    # Fast path for serial: skip the connect handshake entirely.
+    if args.transport == "serial":
+        port = args.port
+        if not port:
+            cands = find_serial_ports()
+            if not cands:
+                print("no USB serial port found; pass --port explicitly.")
+                print("CUT POWER AT THE SWITCH NOW.")
+                return 1
+            port = cands[0][0]
+        print(f"sending emergency stop to {port} (no handshake) ...")
+        wrote = panic_estop_serial(port, args.baud)
+        if wrote:
+            print("WROTE to the board: Ctrl-X reset, M112 halt, M18 steppers off.")
+        else:
+            print("NOTHING WAS SENT. No bytes reached the board.")
+        print("If the noise continues, cut power at the switch. Do not rely on software.")
+        return 0 if wrote else 1
+
     transport = build_transport(args)
     try:
         transport.open()
@@ -1031,10 +1157,15 @@ def cmd_home(args) -> int:
           f"Mount axes lift before the gantry sweeps. ***")
     if "Y" not in axes:
         print("    (Y is excluded by default because it stalled on this machine.)")
+    _install_panic_handlers(transport)
     try:
         driver.home(axes)
-    except (TransportError, MotionBlocked) as e:
-        print(f"HOME FAILED: {e}")
+    except BaseException as e:
+        print(f"HOME FAILED: {type(e).__name__}: {e}")
+        if driver.estop():
+            print("emergency stop written to the board.")
+        else:
+            print("emergency stop could NOT be written. Cut power at the switch.")
         driver.disconnect()
         return 1
 
@@ -1085,6 +1216,7 @@ def cmd_demo(args) -> int:
         return 0
 
     print("\n*** MOTION ENABLED. The gantry will move. ***")
+    _install_panic_handlers(transport)
     try:
         _axes = parse_axes(args.axes) or DEFAULT_HOME_AXES
         print(f"homing {','.join(_axes)} ...")

@@ -1170,8 +1170,13 @@ def cmd_home(args) -> int:
         return 1
 
     if driver.position_known:
-        print(f"\nhomed. TRUE home position: {driver.position()}")
-        print("Record these numbers; they are the real datum for this machine.")
+        if transport.model == "sim":
+            # Never let simulated coordinates be mistaken for a real datum.
+            print(f"\nSIMULATED home position: {driver.position()} "
+                  f"(in-memory only, NOT your machine)")
+        else:
+            print(f"\nhomed. TRUE home position: {driver.position()}")
+            print("Record these numbers; they are the real datum for this machine.")
     else:
         print("\nhomed, but the position READ-BACK FAILED, so the datum is unknown.")
         print("Not printing a number here: inventing one is how a bogus datum")
@@ -1297,6 +1302,19 @@ def main() -> int:
     add_conn_args(sub.add_parser("config", help="dump the board's axis config, no motion"), "serial")
 
     args = ap.parse_args()
+
+    # A --port with --transport sim is always a mistake, and a dangerous one:
+    # every command silently runs in the simulator while the output reads like
+    # success, so an operator watching the log believes the machine moved when
+    # nothing was ever written to it. Refuse rather than guess which was meant.
+    if getattr(args, "port", None) and getattr(args, "transport", None) == "sim":
+        raise SystemExit(
+            "--port was given but --transport is 'sim'.\n"
+            "Nothing would reach the hardware, yet the output would still look\n"
+            "like success. Pass '--transport serial' to drive the board, or drop\n"
+            "--port to simulate on purpose."
+        )
+
     if args.cmd == "detect":
         detect()
         return 0

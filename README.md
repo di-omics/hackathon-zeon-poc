@@ -49,11 +49,32 @@ Not working, and not to be claimed as working:
   verified on this machine and guessing sends the pipette into the deck.
 - No full-envelope move and no liquid handling has been demonstrated.
 
-## Values that still need verifying
+## Learn the envelope, do not guess it
 
-`SOFT_LIMITS` and the GCode words in `ot_driver.py` are documented platform
-defaults, not measurements from this machine. They are marked in the source.
-Confirm them on the hardware before trusting them.
+`SOFT_LIMITS` in `ot_driver.py` are documented platform defaults, not
+measurements from this machine, and commanding a coordinate past the real
+envelope is what overreached during bring-up. The board already knows the right
+answer, so ask it:
+
+    python3 ot_driver.py config --transport serial --port /dev/cu.usbmodem11201
+
+That reads Smoothieware's own `config-get` values for every axis and commands no
+motion. It reports, per axis, `max_travel`, `homing_direction`, `min`, `max` and
+the homing rates, then derives the real soft limits from them. Smoothieware names
+axes by Greek letter, mapped here as `alpha=X beta=Y gamma=Z delta=A epsilon=B
+zeta=C`.
+
+`homing_direction` is the value that explains a home which grinds instead of
+arriving: if it points away from where the endstop physically sits, the axis
+drives to the far stop. That is the first thing to check for `Y`.
+
+To move using the learned envelope rather than the guesses:
+
+    python3 ot_driver.py demo --transport serial --port /dev/cu.usbmodem11201 \
+        --learn-limits --go
+
+If the envelope cannot be read, `--learn-limits` refuses to move rather than
+silently falling back to the guessed numbers.
 
 ## Safety notes
 

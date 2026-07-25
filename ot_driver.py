@@ -54,6 +54,20 @@ SMOOTHIE_RESET = b"\x18"          # Ctrl-X: handled at the serial layer, so it
                                   # sit behind a queued long move.
 SERIAL_BAUD = 115200
 
+# Smoothieware names its axes by Greek letter. Opentrons wires them up as below,
+# confirmed against this board's own six-axis M114.2 reply.
+SMOOTHIE_AXIS_MAP = {
+    "X": "alpha", "Y": "beta", "Z": "gamma",
+    "A": "delta", "B": "epsilon", "C": "zeta",
+}
+# Config keys worth reading before trusting any coordinate. max_travel is how far
+# homing will drive before giving up, and homing_direction says which end it
+# drives toward; together they explain a home that grinds instead of arriving.
+CONFIG_KEYS = (
+    "max_travel", "homing_direction", "min", "max",
+    "fast_homing_rate_mm_s", "slow_homing_rate_mm_s", "limit_enable",
+)
+
 # Axes proven to home cleanly on this machine on 2026-07-25: Z, A, X each
 # acknowledged G28.2. Y did NOT ack and stalled audibly, so it is excluded by
 # default until the cause is found. Pass --axes to override deliberately.
@@ -117,6 +131,12 @@ class Transport:
 
     def endstops(self) -> Dict[str, int]:
         raise TransportError("endstop read is not supported by this transport")
+
+    def axis_config(self) -> Dict[str, Dict[str, str]]:
+        raise TransportError("config read is not supported by this transport")
+
+    def learn_limits(self) -> Dict[str, Tuple[float, float]]:
+        raise TransportError("limit learning is not supported by this transport")
 
 
 @dataclass
@@ -304,6 +324,69 @@ class SerialGCodeTransport(Transport):
                     pass
         return states
 
+    # -- configuration, read from the board itself -------------------------
+    def config_get(self, key: str) -> str:
+        """Read one Smoothieware config value. Commands no motion."""
+        raw = self._send(f"config-get sd {key}")
+        # Replies look like "alpha_max_travel: 400.0000" followed by "ok".
+        text = " ".join(raw.split())
+        for marker in (key + ":", key):
+            if marker in text:
+                text = text.split(marker, 1)[1]
+                break
+        return text.replace("ok", "").strip()
+
+    def axis_config(self) -> Dict[str, Dict[str, str]]:
+        """Dump the configured travel and homing direction for every axis."""
+        out: Dict[str, Dict[str, str]] = {}
+        for ot_axis, smoothie in SMOOTHIE_AXIS_MAP.items():
+            vals: Dict[str, str] = {}
+            for key in CONFIG_KEYS:
+                try:
+                    vals[key] = self.config_get(f"{smoothie}_{key}")
+                except TransportError:
+                    vals[key] = ""
+            out[ot_axis] = vals
+        return out
+
+    def learn_limits(self) -> Dict[str, Tuple[float, float]]:
+        """Derive real soft limits from the board's own config.
+
+        This exists because the hard-coded SOFT_LIMITS in this file are platform
+        defaults, not measurements, and commanding a coordinate past the real
+        envelope is what overreached on this machine. Prefer these numbers.
+        """
+        cfg = self.axis_config()
+        limits: Dict[str, Tuple[float, float]] = {}
+        for axis in ("X", "Y", "Z"):
+            vals = cfg.get(axis, {})
+            lo_s, hi_s, travel_s = vals.get("min", ""), vals.get("max", ""), vals.get("max_travel", "")
+            lo = hi = None
+            try:
+                lo = float(lo_s)
+            except (TypeError, ValueError):
+                pass
+            try:
+                hi = float(hi_s)
+            except (TypeError, ValueError):
+                pass
+            if hi is None:
+                # Some configs express the envelope only as max_travel.
+                try:
+                    hi = float(travel_s)
+                except (TypeError, ValueError):
+                    hi = None
+            if lo is None:
+                lo = 0.0
+            if hi is not None and hi > lo:
+                limits[axis.lower()] = (lo, hi)
+        if not limits:
+            raise TransportError(
+                "the board reported no usable min/max/max_travel values, so the "
+                "envelope cannot be learned. Do not guess it."
+            )
+        return limits
+
     def home(self, axes: Optional[Tuple[str, ...]] = None) -> None:
         # Opentrons axis map, confirmed from this board's own M114.2 reply:
         # X, Y = gantry; Z = left mount; A = right mount; B, C = plungers.
@@ -450,6 +533,7 @@ class OTDriver:
         self._last = Position()
         self._homed = False
         self._homed_axes: Tuple[str, ...] = ()
+        self._learned_limits: Optional[Dict[str, Tuple[float, float]]] = None
         self._open = False
 
     # -- lifecycle ----------------------------------------------------------
@@ -476,7 +560,20 @@ class OTDriver:
     # -- safety -------------------------------------------------------------
     @property
     def limits(self) -> Dict[str, Tuple[float, float]]:
-        return SOFT_LIMITS.get(self.t.model, SOFT_LIMITS["sim"])
+        """Limits learned from the board win over the hard-coded guesses."""
+        base = dict(SOFT_LIMITS.get(self.t.model, SOFT_LIMITS["sim"]))
+        if self._learned_limits:
+            base.update(self._learned_limits)
+        return base
+
+    @property
+    def limits_are_learned(self) -> bool:
+        return bool(self._learned_limits)
+
+    def learn_limits(self) -> Dict[str, Tuple[float, float]]:
+        """Replace the guessed envelope with the board's own configuration."""
+        self._learned_limits = self.t.learn_limits()
+        return self._learned_limits
 
     def _guard_motion(self) -> None:
         if not self._open:
@@ -758,6 +855,54 @@ def cmd_endstops(args) -> int:
     return 0
 
 
+def cmd_config(args) -> int:
+    """Dump the board's own axis configuration. Commands no motion.
+
+    This is the "learn the homing positions first" step. Everything here comes
+    from the board, so it replaces guesswork about the envelope.
+    """
+    transport = build_transport(args)
+    try:
+        transport.open()
+    except TransportError as e:
+        print(f"connect failed: {e}")
+        return 1
+    try:
+        cfg = transport.axis_config()
+    except TransportError as e:
+        print(f"config read failed: {e}")
+        transport.close()
+        return 1
+
+    print("\n=== axis configuration, straight from the board ===")
+    print("(Smoothieware: alpha=X beta=Y gamma=Z delta=A epsilon=B zeta=C)")
+    for axis in ("X", "Y", "Z", "A", "B", "C"):
+        vals = cfg.get(axis) or {}
+        if not any(vals.values()):
+            continue
+        print(f"\n-- {SMOOTHIE_AXIS_MAP[axis]} ({axis}) --")
+        for k in CONFIG_KEYS:
+            print(f"   {k:24} -> {vals.get(k) or '(no value)'}")
+
+    try:
+        learned = transport.learn_limits()
+        print("\n=== derived soft limits (use these, not the hard-coded guesses) ===")
+        for a in sorted(learned):
+            lo, hi = learned[a]
+            print(f"   {a}: ({lo:.1f}, {hi:.1f})")
+    except TransportError as e:
+        print(f"\ncould not derive limits: {e}")
+
+    ydir = (cfg.get("Y") or {}).get("homing_direction", "")
+    if ydir:
+        print(f"\nY homing_direction = {ydir!r}")
+        print("  If that points away from where the Y endstop physically sits, the")
+        print("  axis drives to the far stop and grinds. That would be the fault.")
+
+    transport.close()
+    return 0
+
+
 def cmd_home(args) -> int:
     """Home only, then report the true home coordinates.
 
@@ -816,7 +961,21 @@ def cmd_demo(args) -> int:
         return 1
 
     print(f"\nconnected: {driver.describe()}")
-    print(f"soft limits ({transport.model}): {driver.limits}")
+
+    if getattr(args, "learn_limits", False):
+        try:
+            learned = driver.learn_limits()
+            print(f"learned envelope from the board: {learned}")
+        except TransportError as e:
+            # Asked to learn and could not: refuse to fall back to guesses,
+            # because moving on a guessed envelope is what overreached before.
+            print(f"could not learn the envelope from the board: {e}")
+            print("refusing to move on guessed limits.")
+            driver.disconnect()
+            return 1
+
+    src = "LEARNED from board" if driver.limits_are_learned else "hard-coded GUESS"
+    print(f"soft limits ({transport.model}, {src}): {driver.limits}")
 
     if not args.go:
         print(
@@ -885,12 +1044,16 @@ def main() -> int:
         p.add_argument("--axes", default=None,
                        help=f"comma-separated axes to home; default "
                             f"{','.join(DEFAULT_HOME_AXES)} (Y excluded: it stalled)")
+        p.add_argument("--learn-limits", action="store_true", dest="learn_limits",
+                       help="read the real envelope from the board instead of "
+                            "trusting the hard-coded guesses")
         p.add_argument("--go", action="store_true", help="REQUIRED to allow motion")
 
     add_conn_args(sub.add_parser("home", help="home only, then report true home coords"))
     add_conn_args(sub.add_parser("demo", help="home, then run a short move sequence"))
     add_conn_args(sub.add_parser("estop", help="panic button: cut motion now"))
     add_conn_args(sub.add_parser("endstops", help="read endstop states, no motion"))
+    add_conn_args(sub.add_parser("config", help="dump the board's axis config, no motion"))
 
     args = ap.parse_args()
     if args.cmd == "detect":
@@ -900,6 +1063,8 @@ def main() -> int:
         return cmd_estop(args)
     if args.cmd == "endstops":
         return cmd_endstops(args)
+    if args.cmd == "config":
+        return cmd_config(args)
     if args.cmd == "home":
         return cmd_home(args)
     return cmd_demo(args)

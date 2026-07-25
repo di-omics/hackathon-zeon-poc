@@ -48,11 +48,20 @@ Verified on the bench unit on 2026-07-25:
 
 Not working, and not to be claimed as working:
 
-- **`Y` does not home.** `G28.2 Y` never acknowledges and the axis stalls
-  audibly against a stop. Cause not yet established. The candidates are a
-  blocked axis, an inverted homing direction, or a dead or disconnected `Y`
-  endstop switch. Run the `endstops` command and press the switch by hand to
-  tell those apart.
+- **No endstop on ANY axis registers with the board.** This is established, not a
+  candidate: `M119` was polled for 18 s while the `Z` limit switch was pressed by
+  hand and no bit ever changed, and the firmware config has no axis limit entries
+  (`config-get sd gamma_min` returns `not in config`). So `G28.2` never terminates
+  on a limit; it drives a fixed search distance and zeroes the counter. Homing `Z`
+  twice in a row took 5.44 s then 6.56 s, where a real second home would finish
+  in a fraction of a second because it starts already on the switch.
+- **`Y` does not home**, and this is why. `G28.2 Y` drove looking for a switch
+  that never reports and ground against a hard stop. Y is not specially broken;
+  `Z` does the same thing, just without an obstruction in its path. See
+  `HARDWARE-FINDINGS.md`.
+- **`Z=0` after homing is therefore not a physical datum**, and absolute
+  positioning cannot be trusted on this machine. Use relative `G91` jogging
+  (`scripts/jog_z.py`), which needs no datum.
 - Because of that, `Y` is excluded from `DEFAULT_HOME_AXES`, and the driver
   refuses to command any axis it has not homed, since an absolute move on an
   unhomed axis can drive it into a hard stop.
@@ -75,9 +84,10 @@ On this firmware (`v1.0.3`), the queried `gamma_*` travel and homing keys report
 The focused calibrator therefore uses the archived OT-One 100 mm Z dimension
 with a 5 mm reserve and refuses any target outside 0..95 mm.
 
-If a config does expose `homing_direction`, a wrong value can explain a home
-that drives away from its switch. This particular firmware did not expose the
-value, so the Y fault remains mechanical, wiring, or firmware-config diagnosis.
+If a config does expose `homing_direction`, a wrong value can explain a home that
+drives away from its switch. This firmware exposes no such value, but the Y fault
+no longer needs that diagnosis: the endstop poll above showed no switch is read on
+any axis, which accounts for the stall on its own.
 
 On firmware that exposes a complete envelope, the general driver can use it:
 
